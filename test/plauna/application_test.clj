@@ -10,7 +10,8 @@
             [plauna.files :as files]
             [plauna.application :as app])
   (:import [plauna.database SqliteDB]
-           [plauna.analysis BasicAnalyzer]))
+           [plauna.analysis BasicAnalyzer]
+           [jakarta.mail Folder MessagingException]))
 
 (t/set-ns-filter! {:disallow "plauna.*"})
 
@@ -164,3 +165,125 @@
         (is (= "test-conn-id" (:connection-id metadata)))
         (is (= "another-cat" (:category metadata)))
         (is (= 1.0 (:category-confidence metadata)))))))
+
+;; ---------- Parse run (read-emails-from-folder) tests ----------
+
+(defn wait-for-run [run-id pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [run (get @app/parse-runs run-id)]
+        (cond
+          (and (some? run) (pred run)) run
+          (< (System/currentTimeMillis) deadline) (do (Thread/sleep 20) (recur))
+          :else ::timeout)))))
+
+(defn fake-folder
+  "Proxy jakarta.mail.Folder with a fixed message count. Tracks .close calls."
+  [total close-atom]
+  (let [dummy-store (.getStore (jakarta.mail.Session/getInstance (java.util.Properties.)) "imap")]
+    (proxy [jakarta.mail.Folder] [dummy-store]
+      (getName [] "TESTFOLDER")
+      (isOpen [] true)
+      (close [_] (when close-atom (swap! close-atom inc)))
+      (getMessageCount [] (or total 0)))))
+
+(defrecord TestParseConnection [id context folder open-count]
+  int/IMAPConnection
+  (config [_] {:imap {:id id}})
+  (connect [_])
+  (connected? [_] true)
+  (disconnect-and-stop-monitoring [_])
+  (list-folders [_])
+  (no-of-messages-in-folder [_ _folder-name]
+    (swap! open-count inc)
+    {:message-count (.getMessageCount ^jakarta.mail.Folder folder) :connection-id id :folder folder})
+  (message-at [_ _folder n] ((:message-at-fn context) folder n))
+  (nth-message-in-folder [_ _folder-name _n] {:email nil :message (Object.)})
+  (move-message [_ _m _s _t])
+  (move-email-by-id [_ _m _s _t])
+  (monitor-folders [_])
+  (update-config [_ _c]))
+
+(defn fake-analyzer []
+  (reify int/Analyzer
+    (enrich-email [_ email] email)
+    (detect-language [_ _email] {:code "en" :confidence 0.9})
+    (normalize [_ _body-part] nil)))
+
+(defn fake-db [saved-atom]
+  (reify int/DB
+    (save-email [_ email] (swap! saved-atom conj email))))
+
+(defn parse-conn-fn
+  "Mock connection for parse tests.
+  opts: :id :total :message-at-fn (fn [folder n] -> {:email ... :message ...}, may throw)
+  Returns {:conn ... :open-count ... :close-count ... :saved ...}."
+  [{:keys [id total message-at-fn]}]
+  (let [close-atom (atom 0)
+        open-count (atom 0)
+        saved-atom (atom [])
+        folder (fake-folder total close-atom)
+        conn (->TestParseConnection id
+                                    {:analyzer (fake-analyzer)
+                                     :db (fake-db saved-atom)
+                                     :message-at-fn (or message-at-fn (fn [_ _n] {:email {:header {:subject "s"} :metadata nil} :message (Object.)}))}
+                                    folder
+                                    open-count)]
+    {:conn conn :folder folder :open-count open-count :close-count close-atom :saved saved-atom}))
+
+(defn poison-exception
+  "MessagingException caused by angus ParsingException caused by AddressException."
+  []
+  (MessagingException. "Failed to load IMAP envelope"
+                       (org.eclipse.angus.mail.iap.ParsingException.
+                        "ADDRESS parse error"
+                        (jakarta.mail.internet.AddressException. "Domain contains dot-dot"))))
+
+(def parse-options {:move? false :assigned-category nil :assigned-category-id nil})
+
+(deftest parse-run-opens-folder-once-and-closes-it
+  (let [{:keys [conn open-count close-count saved]} (parse-conn-fn {:id "conn-once" :total 3})
+        total (app/read-emails-from-folder conn "TESTFOLDER" parse-options)]
+    (is (= 3 total) "returns the number of messages in the folder")
+    (let [run (wait-for-run ["conn-once" "TESTFOLDER"] #(= :completed (:status %)) 5000)]
+      (is (not= ::timeout run) "run should complete")
+      (is (= 3 (:saved run)) "all messages saved")
+      (is (= 0 (:skipped run)))
+      (is (= 3 (count @saved)) "three emails reached the database")
+      (is (= 1 @open-count) "folder opened exactly once for the whole run")
+      (is (= 1 @close-count) "folder closed after the run"))))
+
+(deftest parse-run-skips-poison-messages
+  (let [processed (atom [])
+        {:keys [conn saved]}
+        (parse-conn-fn {:id "conn-poison" :total 3
+                        :message-at-fn (fn [_ n]
+                                         (if (= n 2)
+                                           (throw (poison-exception))
+                                           (do (swap! processed conj n)
+                                               {:email {:header {:subject "s"} :metadata nil} :message (Object.)})))})]
+    (app/read-emails-from-folder conn "TESTFOLDER" parse-options)
+    (let [run (wait-for-run ["conn-poison" "TESTFOLDER"] #(= :completed (:status %)) 5000)]
+      (is (not= ::timeout run) "run completes despite the poison message")
+      (is (= 2 (:saved run)))
+      (is (= 1 (:skipped run)))
+      (is (= 1 (count (:errors run))) "one error recorded")
+      (is (= 2 (get-in run [:errors 0 :index])) "error index is the poison message")
+      (is (= [3 1] @processed) "messages after the poison are still processed"))))
+
+(deftest parse-run-retries-transient-then-fails-loudly
+  (let [attempts (atom 0)
+        {:keys [conn]}
+        (parse-conn-fn {:id "conn-fatal" :total 3
+                        :message-at-fn (fn [_ _n]
+                                         (swap! attempts inc)
+                                         (throw (MessagingException. "connection failure")))})]
+    (binding [app/*retry-delays* [50 50]]
+      (app/read-emails-from-folder conn "TESTFOLDER" parse-options)
+      (let [run (wait-for-run ["conn-fatal" "TESTFOLDER"] #(contains? #{:completed :failed} (:status %)) 10000)]
+        (is (not= ::timeout run) "run reaches a terminal status")
+        (is (= :failed (:status run)) "persistent transient error fails the run")
+        (is (= 3 (:total run)))
+        (is (= (+ 1 (count [50 50])) @attempts) "1 initial + N retries before failing")
+        (is (string? (:error run)) "failure reason recorded")
+        (is (= 0 (:saved run)) "nothing saved before the failure at message 3")))))

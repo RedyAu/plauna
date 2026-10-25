@@ -42,6 +42,7 @@
   (list-folders [this])
   (no-of-messages-in-folder [this folder-name])
   (nth-message-in-folder [this folder-name n])
+  (message-at [this folder n] "Return {:email ... :message ...} for the nth (1-based) message of an already-open folder. Does not open or close the folder.")
   (move-message [this message source-name target-name])
   (move-email-by-id [this message-id source-name target-name])
   (monitor-folders [this])
