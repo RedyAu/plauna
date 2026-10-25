@@ -17,3 +17,7 @@ pom.xml.asc
 .clerk/
 .clj-kondo/
 .cpcache/
+node_modules/
+.shadow-cljs/
+/resources/public/js/
+.cptr
