@@ -167,6 +167,26 @@
   (t/log! :info ["Parsing" folder-name ":" processed "/" total
                  "messages processed (" saved "saved," skipped "skipped)"]))
 
+;; Registry of parse runs, keyed by [connection-id folder-name]:
+;; {:total ... :done ... :saved ... :skipped ... :errors [...] :status :running|:completed|:failed
+;;  :started-at ... :finished-at ... :error ...}. Newest run per folder wins.
+(defonce parse-runs (atom {}))
+
+(defn- update-run! [run-id run-updates]
+  (swap! parse-runs update-in [run-id] merge run-updates))
+
+(defn- append-run-error! [run-id error]
+  (swap! parse-runs update-in [run-id :errors] conj error))
+
+(defn parse-run-status
+  "Public read of the parse-run registry for a connection id.
+  Returns a map of {folder-name run-map} for that connection's runs."
+  [connection-id]
+  (into {}
+        (comp (filter (fn [[[cid _] _]] (= (str cid) (str connection-id))))
+              (map (fn [[[_ folder-name] run]] [folder-name run])))
+        @parse-runs))
+
 (defn- poison-message?
   "True if the exception chain contains an IMAP parse/poison error (e.g. a message
   envelope that angus-mail refuses to parse). Such messages are skipped, not retried:
@@ -220,7 +240,7 @@
   "Process messages n..1 of the open folder, descending so that expunges/moves only
   shift indices we have already passed. Returns the final run counters:
   {:status ... :done ... :saved ... :skipped ... :error ...}. Never throws."
-  [connection ^Folder folder total options]
+  [connection ^Folder folder total options run-id]
   (loop [n total
          saved 0
          skipped 0]
@@ -233,6 +253,7 @@
         (case outcome
           :saved
           (do (when (zero? (rem n 25))
+                (update-run! run-id {:done (inc (- total n)) :saved (inc saved) :skipped skipped})
                 (log-progress! (.getName folder) (inc (- total n)) total (inc saved) skipped))
               (recur (dec n) (inc saved) skipped))
           :skipped
@@ -240,7 +261,9 @@
             (t/log! {:level :error :error ex}
                     ["Skipping message" n "in folder" (.getName folder)
                      "because it could not be parsed:" (ex-message ex)])
+            (append-run-error! run-id {:index n :message (ex-message ex)})
             (when (zero? (rem n 25))
+              (update-run! run-id {:done (inc (- total n)) :saved saved :skipped (inc skipped)})
               (log-progress! (.getName folder) (inc (- total n)) total saved (inc skipped)))
             (recur (dec n) saved (inc skipped)))
           ;; :fatal — abort loudly with partial counts
@@ -256,29 +279,42 @@
   the folder. Emails are processed asynchronously: the folder is opened once for the
   whole run and closed when the run ends. Poison (unparseable) messages are skipped
   and logged; transient errors are retried with backoff; a persistent failure fails
-  the run loudly (logged) instead of dying silently."
+  the run loudly (logged + registry) instead of dying silently. Run state is
+  tracked in the parse-runs registry (see parse-run-status)."
   [^plauna.interfaces.IMAPConnection connection folder-name options]
   (let [messages-result (int/no-of-messages-in-folder connection folder-name)
         folder ^Folder (:folder messages-result)
-        total (:message-count messages-result)]
+        total (:message-count messages-result)
+        run-id [(:id connection) folder-name]]
+    (swap! parse-runs assoc run-id {:total total
+                                    :done 0 :saved 0 :skipped 0 :errors []
+                                    :status :running
+                                    :started-at (System/currentTimeMillis)})
     (if (> total 0)
       (do
         (t/log! :info ["There are" total "emails in" folder-name "The messages will get processed asynchronously"])
         (async/go
           (let [summary
                 (try
-                  (parse-folder-loop connection folder total options)
+                  (assoc (parse-folder-loop connection folder total options run-id)
+                         :finished-at (System/currentTimeMillis))
                   (catch Exception e
                     (t/log! {:level :error :error e} ["Unexpected error in parse run of" folder-name])
-                    {:status :failed :error (ex-message e)})
+                    {:status :failed
+                     :error (ex-message e)
+                     :finished-at (System/currentTimeMillis)})
                   (finally
                     (try (.close folder false)
                          (catch Exception e
                            (t/log! :warn ["Could not close folder" folder-name "after parse run:" (ex-message e)])))))]
-            (t/log! :info ["Finished parsing" folder-name "-" (:status summary)
-                           ":" (:saved summary) "saved," (:skipped summary) "skipped of" total
-                           (when-let [err (:error summary)] (str " Error: " err))]))))
-      (t/log! :info ["There are no emails in the folder. Doing nothing."]))
+            ;; publish the terminal status only after the folder is released
+            (update-run! run-id summary)
+            (let [run (get @parse-runs run-id)]
+              (t/log! :info ["Finished parsing" folder-name "-" (:status run)
+                             ":" (:saved run) "saved," (:skipped run) "skipped of" total
+                             (when-let [err (:error run)] (str " Error: " err))])))))
+      (do (update-run! run-id {:status :completed :finished-at (System/currentTimeMillis)})
+          (t/log! :info ["There are no emails in the folder. Doing nothing."])))
     total))
 
 (defn recategorize-email [email category-id connection]

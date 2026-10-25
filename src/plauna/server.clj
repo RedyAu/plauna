@@ -308,6 +308,9 @@
                (success-json-with-body {}))
              (error-json-with-body 404 operation))))))
 
+   (comp/GET "/api/admin/connections/:id/parse-status" [id]
+     (success-json-with-body (generate-string (app/parse-run-status id))))
+
    (comp/POST "/api/admin/connections/:id/controls" request
      (let [id (:id (:route-params request))
            operation (:operation (:body request))]

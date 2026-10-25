@@ -22,6 +22,37 @@
 
 (defonce parse-settings (r/atom {:folder "" :move false :category ""}))
 
+(defn- parse-run-snackbar
+  "Show a snackbar message for a terminal parse run."
+  [folder-name run]
+  (if (= "completed" (:status run))
+    (comps/show-snackbar (str "Finished parsing " folder-name ": "
+                              (:saved run) " saved, " (:skipped run) " skipped"
+                              (when (pos? (:skipped run)) " (see logs)"))
+                         :success)
+    (comps/show-snackbar (str "Parsing " folder-name " failed: " (:error run))
+                         :warning)))
+
+(defn poll-parse-status
+  "Poll the parse-status endpoint after a parse was started and show a snackbar
+  message when the run reaches a terminal status. Uses the existing snackbar
+  mechanism; adds no new UI elements."
+  [connection-id folder-name]
+  (let [started-before (- (js/Date.now) 60000) ; ignore terminal runs from before this parse was triggered
+        deadline (+ (js/Date.now) (* 10 60 1000))] ; stop polling after 10 minutes
+    ((fn poll []
+       (backend/fetch-parse-status
+        connection-id
+        (fn [response]
+          (let [run (get (:body response) (keyword folder-name))]
+            (if (and (= 200 (:status response))
+                     run
+                     (contains? #{"completed" "failed"} (:status run))
+                     (>= (:started-at run 0) started-before))
+              (parse-run-snackbar folder-name run)
+              (when (< (js/Date.now) deadline)
+                (js/setTimeout poll 2000))))))))))
+
 (def connections-backend-call (r/atom false))
 
 (def connection-backend-call (r/atom false))
@@ -308,7 +339,9 @@
                                                                        :parse
                                                                        @parse-settings)
                                                              :on-success
-                                                             (fn [res-body] (comps/show-snackbar (:message res-body) (:type res-body)))}))} "Parse E-Mails"]]
+                                                             (fn [res-body]
+                                                               (comps/show-snackbar (:message res-body) (:type res-body))
+                                                               (poll-parse-status (get (js->clj params) "id") (:folder @parse-settings)))}))} "Parse E-Mails"]]
                    [:div "You need to be connected for this operation."])]]]
 
               (when (= "oauth2" (:auth-type (:imap @connection-data)))

@@ -168,14 +168,12 @@
 
 ;; ---------- Parse run (read-emails-from-folder) tests ----------
 
-(defn wait-for
-  "Poll an atom until (pred @atom) is truthy or timeout-ms elapses."
-  [atom-val pred timeout-ms]
+(defn wait-for-run [run-id pred timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
     (loop []
-      (let [v @atom-val]
+      (let [run (get @app/parse-runs run-id)]
         (cond
-          (pred v) v
+          (and (some? run) (pred run)) run
           (< (System/currentTimeMillis) deadline) (do (Thread/sleep 20) (recur))
           :else ::timeout)))))
 
@@ -247,11 +245,13 @@
   (let [{:keys [conn open-count close-count saved]} (parse-conn-fn {:id "conn-once" :total 3})
         total (app/read-emails-from-folder conn "TESTFOLDER" parse-options)]
     (is (= 3 total) "returns the number of messages in the folder")
-    (let [v (wait-for close-count #(= 1 %) 5000)]
-      (is (not= ::timeout v) "run should complete (folder closed)")
-      (is (= 3 (count @saved)) "all messages processed and saved")
+    (let [run (wait-for-run ["conn-once" "TESTFOLDER"] #(= :completed (:status %)) 5000)]
+      (is (not= ::timeout run) "run should complete")
+      (is (= 3 (:saved run)) "all messages saved")
+      (is (= 0 (:skipped run)))
+      (is (= 3 (count @saved)) "three emails reached the database")
       (is (= 1 @open-count) "folder opened exactly once for the whole run")
-      (is (= 1 @close-count) "folder closed exactly once after the run"))))
+      (is (= 1 @close-count) "folder closed after the run"))))
 
 (deftest parse-run-skips-poison-messages
   (let [processed (atom [])
@@ -263,21 +263,27 @@
                                            (do (swap! processed conj n)
                                                {:email {:header {:subject "s"} :metadata nil} :message (Object.)})))})]
     (app/read-emails-from-folder conn "TESTFOLDER" parse-options)
-    (let [v (wait-for saved #(= 2 (count %)) 5000)]
-      (is (not= ::timeout v) "run completes despite the poison message")
-      (is (= [3 1] @processed) "messages after the poison are still processed")
-      (is (= 2 (count @saved)) "the two non-poison messages were saved"))))
+    (let [run (wait-for-run ["conn-poison" "TESTFOLDER"] #(= :completed (:status %)) 5000)]
+      (is (not= ::timeout run) "run completes despite the poison message")
+      (is (= 2 (:saved run)))
+      (is (= 1 (:skipped run)))
+      (is (= 1 (count (:errors run))) "one error recorded")
+      (is (= 2 (get-in run [:errors 0 :index])) "error index is the poison message")
+      (is (= [3 1] @processed) "messages after the poison are still processed"))))
 
 (deftest parse-run-retries-transient-then-fails-loudly
   (let [attempts (atom 0)
-        {:keys [conn saved]}
+        {:keys [conn]}
         (parse-conn-fn {:id "conn-fatal" :total 3
                         :message-at-fn (fn [_ _n]
                                          (swap! attempts inc)
                                          (throw (MessagingException. "connection failure")))})]
     (binding [app/*retry-delays* [50 50]]
       (app/read-emails-from-folder conn "TESTFOLDER" parse-options)
-      (let [v (wait-for attempts #(= 3 %) 10000)]
-        (is (not= ::timeout v) "run reaches a terminal state after exhausting retries")
-        (is (= 3 @attempts) "1 initial + 2 retries on message 3 before failing the run")
-        (is (= 0 (count @saved)) "nothing saved before the failure at message 3")))))
+      (let [run (wait-for-run ["conn-fatal" "TESTFOLDER"] #(contains? #{:completed :failed} (:status %)) 10000)]
+        (is (not= ::timeout run) "run reaches a terminal status")
+        (is (= :failed (:status run)) "persistent transient error fails the run")
+        (is (= 3 (:total run)))
+        (is (= (+ 1 (count [50 50])) @attempts) "1 initial + N retries before failing")
+        (is (string? (:error run)) "failure reason recorded")
+        (is (= 0 (:saved run)) "nothing saved before the failure at message 3")))))
