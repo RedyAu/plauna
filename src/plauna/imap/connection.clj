@@ -339,6 +339,13 @@
       {:email (parser/message->email message (:id this))
        :message message}))
 
+  (message-at [this folder n]
+    (let [message (.getMessage ^IMAPFolder folder n)]
+      (set-message-as-peek message)
+      (t/log! :debug ["Reading message number" n "from" (.getName folder)])
+      {:email (parser/message->email message (:id this))
+       :message message}))
+
   (move-message [this message source-folder-name target-folder-name]
     (handle-move-email this message source-folder-name target-folder-name))
 
